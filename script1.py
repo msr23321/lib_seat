@@ -1,4 +1,4 @@
-#修正v17登录访问频次过高可能导致的图形码奔溃
+# 修正v17登录访问频次过高可能导致的图形码奔溃
 import base64
 from io import BytesIO
 from PIL import Image
@@ -13,16 +13,102 @@ from selenium.webdriver.edge.options import Options as EdgeOptions
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 import sys
 import os
+import time
+from datetime import datetime, timedelta, timezone
+
+# ================= 依赖 =================
+import numpy as np
+# ========================================
 '''your_account1,your_password1,start_time1,end_time1,
 your_account2,your_password2,start_time2,end_time2,your_preferroom,your_prefersit,'''
 # 账号密码字典
 
 
-
-
 ocr = ddddocr.DdddOcr(det=False, use_gpu=False)
+# ================= 全局初始化自定义 PaddleOCR 模型 =================
+# 模型现在直接放在 GitHub 仓库里，不再需要下载链接
+_MODEL_DIR = "./ocr_model"
 
-#全天可约性检查，通用版
+# ================= 全局：直接用 Paddle 原生 API 加载推理模型 =================
+import paddle
+import paddle.nn.functional as F
+import yaml as _yaml
+
+def _load_config(cfg_path):
+    with open(cfg_path, 'r', encoding='utf-8') as f:
+        return _yaml.safe_load(f)
+
+def _build_rec_model_native(model_dir):
+    """
+    使用 Paddle 工业级 Inference 引擎加载模型，
+    彻底绕过 jit.load 的环境兼容性 Bug。
+    """
+    import paddle.inference as paddle_infer
+    abs_model_dir = os.path.abspath(model_dir)
+    
+    # 明确指定 model 和 params 文件的绝对路径
+    model_file = os.path.join(abs_model_dir, "inference.pdmodel")
+    params_file = os.path.join(abs_model_dir, "inference.pdiparams")
+    
+    # 初始化推理配置
+    config = paddle_infer.Config(model_file, params_file)
+    config.disable_gpu()        # GitHub Actions 只有 CPU
+    config.enable_mkldnn()      # 开启 CPU 硬件加速
+    config.switch_ir_optim()    # 开启计算图优化
+    
+    # 创建终极预测器
+    predictor = paddle_infer.create_predictor(config)
+
+    # 读取字符表
+    dict_path = os.path.join(abs_model_dir, "ppocr_keys_v1.txt")
+    with open(dict_path, 'r', encoding='utf-8') as f:
+        char_list = [line.strip() for line in f if line.strip()]
+    
+    # CTCLabelDecode 字符表：blank + 字符 + space
+    char_dict = ['blank'] + char_list + [' ']
+    return predictor, char_dict
+
+def _preprocess_crop(pil_img, target_h=48, target_w=320):
+    """和训练时一致：保持宽高比缩放 + 右侧补0"""
+    import numpy as np
+    img = pil_img.convert('RGB')
+    orig_w, orig_h = img.size
+    scale = target_h / orig_h
+    new_w = min(int(orig_w * scale), target_w)
+    img = img.resize((new_w, target_h), Image.LANCZOS)
+    arr = np.array(img, dtype=np.float32).transpose(2, 0, 1) / 255.0
+    arr = (arr - 0.5) / 0.5
+    canvas = np.zeros((3, target_h, target_w), dtype=np.float32)
+    canvas[:, :, :new_w] = arr
+    return paddle.to_tensor(canvas[np.newaxis, :])
+
+print("正在初始化环境...")
+import os
+abs_model_dir = os.path.abspath(_MODEL_DIR)
+print(f"🔍 [侦探模式] 当前寻找的绝对路径: {abs_model_dir}")
+print(f"🔍 [侦探模式] 该目录是否存在? {os.path.exists(abs_model_dir)}")
+
+if os.path.exists(abs_model_dir):
+    print("🔍 [侦探模式] 目录下到底有什么:")
+    for f in os.listdir(abs_model_dir):
+        fpath = os.path.join(abs_model_dir, f)
+        size_kb = os.path.getsize(fpath) / 1024
+        print(f"    - {f} (大小: {size_kb:.2f} KB)")
+else:
+    print("❌ [破案了] GitHub Actions 的运行环境中根本没有 ocr_model 这个文件夹！")
+
+try:
+    # 直接加载本地代码库里的模型
+    _rec_model, _char_dict = _build_rec_model_native(_MODEL_DIR)
+    print(f"✓ 自定义模型加载成功！字符表大小：{len(_char_dict)}")
+    CUSTOM_MODEL_LOADED = True
+except Exception as e:
+    print(f"✗ 自定义模型加载失败: {e}。将降级全部使用 ddddocr。")
+    CUSTOM_MODEL_LOADED = False
+# ============================================================================
+# ====================================================================
+
+# 全天可约性检查，通用版
 
 def idtf_imf(account, password, options):
     """
@@ -41,7 +127,7 @@ def idtf_imf(account, password, options):
             driver.set_page_load_timeout(15)
 
             # 尝试打开登录页面
-            driver.get('http://222.26.125.253/libseat/#/login')
+            driver.get('http://libseat.lnu.edu.cn/#/login')
             time.sleep(1)
 
             # 尝试检测账号输入框，如果不存在则认为网站在维护中
@@ -141,7 +227,190 @@ def idtf_imf(account, password, options):
 
     raise Exception(f"达到最大重试次数 ({max_retries})，无法登录")
 
-def date_if(prefer_sit,driver):
+def solve_click_captcha(driver):
+    hint_img_elem = driver.find_element(By.CSS_SELECTOR, "img.captcha-text")
+    bg_img_elem = driver.find_element(By.CSS_SELECTOR, ".captcha-modal-content img")
+
+    # ---- 提示图：用 ddddocr 识别目标汉字（单字/多字均用此方式） ----
+    hint_bytes = base64.b64decode(hint_img_elem.get_attribute("src").split(",")[1])
+    ocr_cls = ddddocr.DdddOcr(det=False, use_gpu=False, show_ad=False)
+    raw = ocr_cls.classification(hint_bytes)
+    chars_to_click = [c for c in raw if '\u4e00' <= c <= '\u9fff']
+    print(f"OCR原始: '{raw}' → 目标字: {chars_to_click} (共{len(chars_to_click)}个)")
+
+    # ---- 背景图：用 ddddocr det 定位所有字框 ----
+    bg_bytes = base64.b64decode(bg_img_elem.get_attribute("src").split(",")[1])
+    det = ddddocr.DdddOcr(det=True, show_ad=False)
+    bboxes = det.detection(bg_bytes)
+    bg_image = Image.open(BytesIO(bg_bytes)).convert("RGB")
+
+    click_coords = []
+    used_bboxes = set()
+
+    # 多字验证码（艺术字）：用训练模型的 softmax 概率匹配，准确率远高于字符串匹配
+    use_custom_model = CUSTOM_MODEL_LOADED and len(chars_to_click) > 1
+    if use_custom_model:
+        print("检测到多字验证码，启用自定义模型 softmax 概率匹配...")
+
+        # 对每个候选框跑模型，保存完整概率矩阵
+        crop_features = []
+        for i, bbox in enumerate(bboxes):
+            x1, y1, x2, y2 = bbox
+            cropped = bg_image.crop((max(0, x1 - 4), max(0, y1 - 4), x2 + 4, y2 + 4))
+            tensor = _preprocess_crop(cropped)
+            input_data = tensor.numpy()  # Inference 引擎需要 numpy 格式
+            
+            # 喂入数据
+            input_names = _rec_model.get_input_names()
+            input_handle = _rec_model.get_input_handle(input_names[0])
+            input_handle.copy_from_cpu(input_data)
+            
+            # 执行推理
+            _rec_model.run()
+            
+            # 获取结果
+            output_names = _rec_model.get_output_names()
+            output_handle = _rec_model.get_output_handle(output_names[0])
+            preds_ndarray = output_handle.copy_to_cpu()
+            
+            # 计算 softmax 概率
+            # preds_ndarray 可能是 [B,T,C] 或 [T,C]，统一压成 [T,C] 再 softmax
+            if preds_ndarray.ndim == 3:
+                logits = preds_ndarray[0]          # [T, C]
+            else:
+                logits = preds_ndarray             # [T, C]
+            import scipy.special
+            prob_matrix = scipy.special.softmax(logits, axis=1)  # axis=1 对应字符维度C
+            crop_features.append({"idx": i, "bbox": bbox, "prob_matrix": prob_matrix})
+
+        # 按目标字顺序，逐个找概率最高的候选框（每框只用一次）
+        for char in chars_to_click:
+            try:
+                dict_idx = _char_dict.index(char)
+            except ValueError:
+                print(f"✗ '{char}' 不在字符表中，跳过")
+                continue
+
+            best_score, best_idx, best_bbox = -1.0, -1, None
+            for feat in crop_features:
+                if feat["idx"] in used_bboxes:
+                    continue
+                # 取该字在所有时间步上的最大概率作为得分
+                score = float(np.max(feat["prob_matrix"][:, dict_idx]))
+                if score > best_score:
+                    best_score, best_idx, best_bbox = score, feat["idx"], feat["bbox"]
+
+            if best_idx != -1:
+                used_bboxes.add(best_idx)
+                x1, y1, x2, y2 = best_bbox
+                coord = ((x1 + x2) // 2, (y1 + y2) // 2)
+                click_coords.append(coord)
+                print(f"✓ '{char}' → 坐标 {coord}  得分: {best_score:.4f}")
+            else:
+                print(f"✗ 未找到 '{char}'")
+
+    else:
+        # 单字验证码或模型未加载：沿用 ddddocr 字符串匹配
+        print("单字验证码或模型未加载，使用 ddddocr 识别背景字...")
+        candidate_preds = []
+        for i, bbox in enumerate(bboxes):
+            x1, y1, x2, y2 = bbox
+            cropped = bg_image.crop((max(0, x1 - 4), max(0, y1 - 4), x2 + 4, y2 + 4))
+            recognized = ocr_cls.classification(cropped).strip()
+            candidate_preds.append((i, bbox, recognized))
+            print(f"  候选框{i}: bbox={bbox}, 识别='{recognized}'")
+
+        for char in chars_to_click:
+            best_match = None
+            for i, bbox, recognized in candidate_preds:
+                if i in used_bboxes:
+                    continue
+                if char in recognized:
+                    best_match = (i, bbox)
+                    break
+            if best_match:
+                i, (x1, y1, x2, y2) = best_match
+                used_bboxes.add(i)
+                coord = ((x1 + x2) // 2, (y1 + y2) // 2)
+                click_coords.append(coord)
+                print(f"✓ '{char}' 在坐标 {coord}")
+            else:
+                print(f"✗ 未找到 '{char}'")
+
+    return click_coords, bg_img_elem, chars_to_click
+
+
+def handle_captcha_modal(driver):
+    from selenium.webdriver.common.action_chains import ActionChains
+
+    for attempt in range(8):
+        if attempt > 0:
+            try:
+                busy_msg = driver.find_element(By.XPATH, "//*[contains(text(), '系统繁忙')]")
+                wait_seconds = 2 + attempt * 1.5  # 递增退避
+                print(f"检测到系统繁忙，等待{wait_seconds:.1f}秒后重试")
+                time.sleep(wait_seconds)
+            except NoSuchElementException:
+                time.sleep(1.2)  # 正常情况也稍微多等一点
+            driver.find_element(By.CSS_SELECTOR, "img.refresh").click()
+            time.sleep(1.0)
+
+        print(f"验证码第{attempt + 1}次尝试")
+        click_coords, bg_elem, chars = solve_click_captcha(driver)
+
+        if len(click_coords) < len(chars):
+            print(f"未找到目标字，刷新重试")
+            continue
+
+        # 坐标缩放（原图尺寸 vs 渲染尺寸）
+        bg_src = bg_elem.get_attribute("src")
+        bg_bytes = base64.b64decode(bg_src.split(",")[1])
+        orig_w, orig_h = Image.open(BytesIO(bg_bytes)).size
+        render_w = bg_elem.size['width']
+        render_h = bg_elem.size['height']
+        scale_x = render_w / orig_w
+        scale_y = render_h / orig_h
+
+        actions = ActionChains(driver)
+        for cx, cy in click_coords:
+            offset_x = cx * scale_x - render_w / 2
+            offset_y = cy * scale_y - render_h / 2
+            actions.move_to_element_with_offset(bg_elem, offset_x, offset_y)
+            actions.click()
+            actions.pause(0.4)
+        actions.perform()
+        driver.save_screenshot(f"screenshots/captcha_click_{attempt}.png")
+        time.sleep(0.5)
+
+        try:
+            confirm_btn = WebDriverWait(driver, 8).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "button.confirm-btn:not([disabled])"))
+            )
+        except TimeoutException:
+            print(f"第{attempt+1}次：确认按钮未变为可点击，可能系统繁忙，继续重试")
+            continue
+        driver.execute_script("arguments[0].click();", confirm_btn)
+        print("已点击确定")
+        time.sleep(1.0)
+
+        # 检测点击确认后是否弹出"验证码错误"提示
+        try:
+            err_elem = WebDriverWait(driver, 3).until(
+                EC.presence_of_element_located(
+                    (By.XPATH, "//*[contains(text(),'验证码错误') or contains(text(),'请重试')]")
+                )
+            )
+            print(f"验证码点击错误：{err_elem.text}，刷新重试...")
+            # 继续下一轮 attempt（不 return True）
+            continue
+        except TimeoutException:
+            # 没有错误提示，说明验证码通过了
+            print("验证码通过")
+            return True
+
+    print("验证码多次失败")
+    return False
+def date_if(prefer_sit, driver):
     full_day_times = ["08:00", "09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00",
                       "19:00", "20:00", "21:00"]
     # 检查是否出现 reserve-box div
@@ -153,11 +422,11 @@ def date_if(prefer_sit,driver):
     if times_roll and len(times_roll) > 0:
         time_labels = times_roll[0].find_elements(By.TAG_NAME, "label")
         time_texts = [label.text for label in time_labels]
-        if all(time in full_day_times for time in get_time_range(full_day_times,"19:00","22:00")):
+        if all(time in full_day_times for time in get_time_range(full_day_times, "19:00", "22:00")):
             day_type = 3
             return prefer_sit, day_type, driver  # 改进点  # 找到全天可预约的座位，直接返回座位号
         # 检查是否全天可预约
-        else :
+        else:
             print(f'座位{prefer_sit}被抢了，开始随机选座')
             try:
                 close_button = driver.find_element(By.CLASS_NAME, "close-icon")
@@ -167,8 +436,12 @@ def date_if(prefer_sit,driver):
                 pass
             # driver.quit()。
             return None, 3, driver  # 改进点
+
+
 import re
 from zoneinfo import ZoneInfo
+
+
 def wait_until_open(opentime_text):
     # 从文本中提取时和分
     match = re.search(r"(\d{1,2}):(\d{1,2})", opentime_text)
@@ -189,8 +462,9 @@ def wait_until_open(opentime_text):
         if now >= target_time:
             print(f"已到目标时间（北京时间）：{now.strftime('%H:%M:%S')}")
             break
-        #print(f"未到预定时间，北京时间 {now.strftime('%H:%M:%S')}")
+        # print(f"未到预定时间，北京时间 {now.strftime('%H:%M:%S')}")
         time.sleep(0.1)  # 每 0.1 秒检查一次
+
 
 def choose_it(driver, sit_avilable, idx, reading_room, day_type, max_attempts=500):
     """
@@ -207,7 +481,8 @@ def choose_it(driver, sit_avilable, idx, reading_room, day_type, max_attempts=50
     返回:
     bool: 预约是否成功
     """
-    dir_time = {3: [['19:00', '22:00'], ['19:00', '22:00']], 2: [['14:00', '18:00'], ['18:00', '22:00']]}
+    dir_time = {3: [['19:00', '22:00'], ['19:00', '22:00']],
+                2: [['14:00', '18:00'], ['18:00', '22:00']]}
     start_time = dir_time[day_type][idx][0]
     end_time = dir_time[day_type][idx][1]
 
@@ -216,8 +491,8 @@ def choose_it(driver, sit_avilable, idx, reading_room, day_type, max_attempts=50
     while attempt < max_attempts:
         attempt += 1
         print(f"尝试第{attempt}次预约...")
-        skip=False
-        if attempt>=2:
+        skip = False
+        if attempt >= 2:
             try:
                 sit_elem = WebDriverWait(driver, 10).until(
                     EC.presence_of_element_located(
@@ -228,10 +503,10 @@ def choose_it(driver, sit_avilable, idx, reading_room, day_type, max_attempts=50
             except Exception as e:
                 print("点击座位失败:", e)
         try:
-            #检查位置是否还可约全天
-            if (day_type ==3) and (idx==0):
-                sit_avilable,day_type,driver=date_if(sit_avilable, driver)
-                if sit_avilable ==None:
+            # 检查位置是否还可约全天
+            if (day_type == 3) and (idx == 0):
+                sit_avilable, day_type, driver = date_if(sit_avilable, driver)
+                if sit_avilable == None:
                     return False
             # 选择开始时间
             WebDriverWait(driver, 10).until(
@@ -262,13 +537,19 @@ def choose_it(driver, sit_avilable, idx, reading_room, day_type, max_attempts=50
                             EC.element_to_be_clickable((By.CSS_SELECTOR, ".el-button.submit-btn.el-button--default"))
                         )
                         #
-                        if attempt >= 2:
-                            wait_until_open(opentime_text)
-                            submit_button.click()
-                        else:
-                            wait_until_630()
-                            submit_button.click()
-
+                        wait_until_630()
+                        submit_button.click()
+                        try:
+                            WebDriverWait(driver, 3).until(
+                                EC.presence_of_element_located((By.CSS_SELECTOR, "img.captcha-text"))
+                            )
+                            print("检测到点选验证码...")
+                            captcha_ok = handle_captcha_modal(driver)
+                            if not captcha_ok:
+                                print("验证码失败，重试本次预约")
+                                break  # 跳出end_time循环，进入下一次attempt
+                        except TimeoutException:
+                            print("无验证码弹窗，正常继续")
                         # 检查是否出现"正在玩命预约中"的元素，并等待其消失
                         try:
                             # 尝试检测"正在玩命预约中"元素
@@ -313,14 +594,14 @@ def choose_it(driver, sit_avilable, idx, reading_room, day_type, max_attempts=50
                                     except:
                                         result_final = "没有找到任何提示信息"'''
                                 # 等待任意一种结果出现
-                                message_element=WebDriverWait(driver, 8).until(
+                                message_element = WebDriverWait(driver, 8).until(
                                     EC.any_of(
                                         EC.visibility_of_element_located((By.CLASS_NAME, "el-message__content")),
                                         EC.presence_of_element_located((By.XPATH, "//*[contains(text(), '预约成功')]"))
                                     )
                                 )
 
-                                #result_final =
+                                # result_final =
                                 # 检查是哪种情况
                                 result_text = message_element.text
                                 if "预约成功" in result_text:
@@ -355,7 +636,7 @@ def choose_it(driver, sit_avilable, idx, reading_room, day_type, max_attempts=50
 
                                     if "系统可预约时间为" in error_text:
                                         print("未到预约时间，请重新尝试")
-                                        #skip = True
+                                        # skip = True
                                     else:
                                         print("未检测到预期提示，错误信息为：", error_text)
 
@@ -482,8 +763,9 @@ def choose_sit(driver, reading_room):
     return seat_dict, driver
 
 
-# 检查位置的可约性，要么全天可约，要么半天，否则直接放弃;
+# 检查位置的可约性，要么全天可约，要么半天，否则直接放弃
 import random
+
 
 def get_time_range(full_day_times, start_time, end_time):
     try:
@@ -494,6 +776,8 @@ def get_time_range(full_day_times, start_time, end_time):
     except ValueError:
         # 如果start_time或end_time不在列表中，返回空列表或做其他处理
         return []
+
+
 def date_whether(seat_dict, driver):
     import time
     prefer_sit = '102'
@@ -504,7 +788,7 @@ def date_whether(seat_dict, driver):
     shuffled_keys = list(seat_dict.keys())
     random.shuffle(shuffled_keys)
     # 定义需要检查的时间段
-    full_day_times = ["08:00", "09:00","10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00",
+    full_day_times = ["08:00", "09:00", "10:00", "11:00", "12:00", "13:00", "14:00", "15:00", "16:00", "17:00", "18:00",
                       "19:00", "20:00", "21:00"]
     half_day_times = ["14:00", "15:00", "16:00", "17:00", "18:00", "19:00", "20:00", "21:00"]
     # print(seat_dict)
@@ -525,7 +809,8 @@ def date_whether(seat_dict, driver):
                     time_labels = times_roll[0].find_elements(By.TAG_NAME, "label")
                     time_texts = [label.text for label in time_labels]
 
-                    if all(time in time_texts for time in get_time_range(full_day_times,"19:00","22:00")):
+                    if all(time in time_texts for time in
+                           get_time_range(full_day_times, "19:00", "22:00")):
                         print(f"找到全天可预约座位: {i}")
                         found_full_day = True
                         day_type = 3
@@ -612,7 +897,7 @@ def date_whether(seat_dict, driver):
 
 # 检查偏好位置全天可约性并预约
 def prefer_whether(account, password, prefer_sit, reading_room, options):
-    full_day_times = ["08:00","09:00", "10:00", "11:00", "12:00", "13:00", "14:00",
+    full_day_times = ["08:00", "09:00", "10:00", "11:00", "12:00", "13:00", "14:00",
                       "15:00", "16:00", "17:00", "18:00", "19:00", "20:00", "21:00"]
     driver = idtf_imf(account, password, options)
     try:
@@ -621,24 +906,24 @@ def prefer_whether(account, password, prefer_sit, reading_room, options):
         element = wait.until(
             EC.element_to_be_clickable((By.CSS_SELECTOR, ".el-select__caret.el-input__icon.el-icon-arrow-up"))
         )
-        
+
         # 使用 JavaScript 执行点击，避免可能的遮挡问题
         driver.execute_script("arguments[0].click();", element)
-        
+
         # 确保下拉选项完全展开
         time.sleep(1)
-        
+
         # 等待目标选项出现并确保可以点击
         target_option = wait.until(
             EC.element_to_be_clickable((By.XPATH, "//li/span[text()='崇山校区图书馆']"))
         )
-        
+
         # 使用 JavaScript 执行点击
         driver.execute_script("arguments[0].click();", target_option)
-        
+
         # 等待页面响应
         time.sleep(2)
-        
+
     except Exception as e:
         print(f"选择校区时发生错误: {str(e)}")
         # 如果出错，尝试刷新页面重试
@@ -690,7 +975,8 @@ def prefer_whether(account, password, prefer_sit, reading_room, options):
             if times_roll and len(times_roll) > 0:
                 time_labels = times_roll[0].find_elements(By.TAG_NAME, "label")
                 time_texts = [label.text for label in time_labels]
-                if all(time in time_texts for time in get_time_range(full_day_times,"19:00","22:00")):
+                if all(time in time_texts for time in
+                       get_time_range(full_day_times, "19:00", "22:00")):
                     print(f"偏好座位{prefer_sit}全天可约")
                     found_full_day = True
                     # driver.quit()。
@@ -773,35 +1059,36 @@ def perform_operations(driver, sit_avilable, idx, reading_room, day_type, accoun
 
 import tempfile
 
-import time
-from datetime import datetime, timedelta, timezone
-
 
 # 获取北京时间（东八区时间）
 def get_beijing_time():
     return datetime.utcnow().replace(tzinfo=timezone.utc).astimezone(timezone(timedelta(hours=8)))
 
 
-# 等待直到早上 6:30（北京时间）
 def wait_until_630():
     while True:
         now = get_beijing_time()
-        if now.hour > 6 or (now.hour == 6 and now.minute >=29 ):
-            #print(f"当前北京时间 {now.strftime('%H:%M:%S')}，已过 6:29，开始执行任务。")
+        target = now.replace(hour=6, minute=30, second=1, microsecond=0)
+        if now >= target:
             break
+        remaining = (target - now).total_seconds()
+        if remaining > 1:
+            time.sleep(0.5)
         else:
-            #print(f"当前北京时间 {now.strftime('%H:%M:%S')}，未到 6:29，继续等待...")
-            time.sleep(1)  # 每 1 秒检查一次
+            time.sleep(0.05)  # 最后1秒内高频检查
+
+
 # 等待直到早上 6:25（北京时间）
 def wait_until_625():
     while True:
         now = get_beijing_time()
-        if now.hour > 6 or (now.hour == 6 and now.minute >=25 ):
-            #print(f"当前北京时间 {now.strftime('%H:%M:%S')}，已过 6:29，开始执行任务。")
+        if now.hour > 6 or (now.hour == 6 and now.minute >= 25):
+            # print(f"当前北京时间 {now.strftime('%H:%M:%S')}，已过 6:29，开始执行任务。")
             break
         else:
-            #print(f"当前北京时间 {now.strftime('%H:%M:%S')}，未到 6:29，继续等待...")
+            # print(f"当前北京时间 {now.strftime('%H:%M:%S')}，未到 6:29，继续等待...")
             time.sleep(1)  # 每 1 秒检查一次
+
 
 def random_choose(driver):
     '''try:
@@ -899,6 +1186,7 @@ def main():
             options.add_argument('--disable-extensions')
             options.add_argument('--disable-plugins')
             options.add_argument('--disable-images')  # 禁用图片加载，提高速度
+            options.add_argument('--window-size=1920,1080')
             options.add_argument('--headless=new')
             options.add_argument('--disable-gpu')
             options.add_argument('--no-sandbox')
@@ -935,12 +1223,12 @@ def main():
                     over, driver = perform_operations(driver, sit_avilable, idx, reading_room, day_type, account,
                                                       password, options)
                     print(over)
-                    if over== True:
+                    if over == True:
                         # 完成后确保关闭driver
                         driver.quit()
                         driver = None  # 重置driver
                         continue
-                    if over == False:#如果找到的位置被抢了再随机预约一次
+                    if over == False:  # 如果找到的位置被抢了再随机预约一次
                         sit_avilable, day_type, reading_room, driver = random_choose(driver)
                         if sit_avilable is not None:
                             # 登录并执行预约操作
